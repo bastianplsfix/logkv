@@ -8,9 +8,22 @@
  * - Search returns the last occurrence of a key
  * - Files are segmented when they exceed a maximum size
  * - Old segments are compacted to remove stale/deleted data
+ * - In-memory indices are used for fast key lookups (stores byte offsets)
  */
 
 type Record = { key: string; value: string | null };
+
+/**
+ * In-memory index for a segment file.
+ * Maps keys to their byte offsets in the file.
+ */
+type SegmentIndex = Map<string, number>;
+
+/**
+ * Global index map: segment path -> segment index
+ * This is kept in memory for fast lookups.
+ */
+const segmentIndices = new Map<string, SegmentIndex>();
 
 /**
  * Configuration for the database.
@@ -103,6 +116,104 @@ async function getActiveSegment(dbPath: string): Promise<string> {
 }
 
 /**
+ * Build an index for a segment file.
+ * Reads through the file and creates a map of key -> byte offset.
+ */
+async function buildSegmentIndex(segmentPath: string): Promise<SegmentIndex> {
+  const index: SegmentIndex = new Map();
+
+  try {
+    const file = await Deno.open(segmentPath, { read: true });
+    const decoder = new TextDecoder();
+    let offset = 0;
+    let buffer = "";
+
+    try {
+      // Read file in chunks and process line by line
+      for await (const chunk of file.readable) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+
+        // Process all complete lines (leave the last incomplete line in buffer)
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.trim() !== "") {
+            // Extract the key (everything before the first comma)
+            const commaIndex = line.indexOf(",");
+            if (commaIndex !== -1) {
+              const key = line.substring(0, commaIndex);
+              index.set(key, offset);
+            }
+          }
+          // Update offset (add 1 for newline character)
+          offset += new TextEncoder().encode(line + "\n").length;
+        }
+      }
+
+      // Process any remaining data in buffer
+      if (buffer.trim() !== "") {
+        const commaIndex = buffer.indexOf(",");
+        if (commaIndex !== -1) {
+          const key = buffer.substring(0, commaIndex);
+          index.set(key, offset);
+        }
+      }
+    } finally {
+      // File handle is automatically closed by readable stream, but ensure it's closed
+      try {
+        file.close();
+      } catch {
+        // Ignore - may already be closed
+      }
+    }
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return index; // Empty index for non-existent file
+    }
+    throw error;
+  }
+
+  return index;
+}
+
+/**
+ * Get or build the index for a segment file.
+ * Uses cached index if available, otherwise builds and caches it.
+ */
+async function getSegmentIndex(segmentPath: string): Promise<SegmentIndex> {
+  let index = segmentIndices.get(segmentPath);
+  if (!index) {
+    index = await buildSegmentIndex(segmentPath);
+    segmentIndices.set(segmentPath, index);
+  }
+  return index;
+}
+
+/**
+ * Update the index for a segment by adding a new key-offset pair.
+ */
+function updateSegmentIndex(
+  segmentPath: string,
+  key: string,
+  offset: number,
+): void {
+  let index = segmentIndices.get(segmentPath);
+  if (!index) {
+    index = new Map();
+    segmentIndices.set(segmentPath, index);
+  }
+  index.set(key, offset);
+}
+
+/**
+ * Clear the index for a segment (used when segment is deleted during compaction).
+ */
+function clearSegmentIndex(segmentPath: string): void {
+  segmentIndices.delete(segmentPath);
+}
+
+/**
  * Count records in a segment file.
  */
 async function countRecords(segmentPath: string): Promise<number> {
@@ -112,6 +223,52 @@ async function countRecords(segmentPath: string): Promise<number> {
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) {
       return 0;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Read a single record from a segment at a specific byte offset.
+ */
+async function readRecordAtOffset(
+  segmentPath: string,
+  offset: number,
+): Promise<Record | null> {
+  try {
+    const file = await Deno.open(segmentPath, { read: true });
+    await file.seek(offset, Deno.SeekMode.Start);
+
+    const decoder = new TextDecoder();
+    let line = "";
+
+    // Read until we hit a newline
+    const buffer = new Uint8Array(1);
+    while (true) {
+      const bytesRead = await file.read(buffer);
+      if (bytesRead === null) break; // EOF
+
+      const char = decoder.decode(buffer);
+      if (char === "\n") break;
+      line += char;
+    }
+
+    file.close();
+
+    if (line.trim() === "") return null;
+
+    // Parse the record
+    const commaIndex = line.indexOf(",");
+    if (commaIndex === -1) return null;
+
+    const key = line.substring(0, commaIndex);
+    const value = line.substring(commaIndex + 1);
+
+    // Handle tombstone records (null values)
+    return { key, value: value === "null" ? null : value };
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return null;
     }
     throw error;
   }
@@ -174,6 +331,9 @@ async function rotateSegment(dbPath: string): Promise<string> {
   // Create the new empty segment file
   await Deno.writeTextFile(newSegmentPath, "");
 
+  // Initialize an empty index for the new segment
+  segmentIndices.set(newSegmentPath, new Map());
+
   // Only compact when we have at least 4 old segments
   // This prevents compacting too early and gives segments time to accumulate updates/deletes
   // Example: if segments = [db, 1.db, 2.db, 3.db] (where 3.db was just filled)
@@ -197,6 +357,7 @@ async function rotateSegment(dbPath: string): Promise<string> {
 /**
  * Compact multiple segments by removing stale and deleted records.
  * This merges older segments together, keeping only the latest value for each key.
+ * Rebuilds indices for the compacted segment.
  */
 async function compactSegments(
   dbPath: string,
@@ -234,6 +395,12 @@ async function compactSegments(
 
   // Another small delay before file operations
   await new Promise((resolve) => setTimeout(resolve, 50));
+
+  // Clear indices for segments that will be deleted
+  for (const segmentPath of segmentPaths) {
+    clearSegmentIndex(segmentPath);
+  }
+
   // Delete all segments that were compacted
   for (const segmentPath of segmentPaths) {
     try {
@@ -254,10 +421,32 @@ async function compactSegments(
 
   // Rename temp file to first segment
   await Deno.rename(tempPath, firstSegmentPath);
+
+  // Rebuild the index for the compacted segment
+  await buildSegmentIndex(firstSegmentPath);
+  // Store it in the global index map
+  const newIndex = await buildSegmentIndex(firstSegmentPath);
+  segmentIndices.set(firstSegmentPath, newIndex);
+}
+
+/**
+ * Get the current file size in bytes.
+ */
+async function getFileSize(filePath: string): Promise<number> {
+  try {
+    const fileInfo = await Deno.stat(filePath);
+    return fileInfo.size;
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) {
+      return 0;
+    }
+    throw error;
+  }
 }
 
 /**
  * Append a record to the active segment, rotating if necessary.
+ * Updates the index with the new record's offset.
  */
 async function appendRecord(
   dbPath: string,
@@ -268,14 +457,22 @@ async function appendRecord(
   const activeSegment = await getActiveSegment(dbPath);
   const recordCount = await countRecords(activeSegment);
 
+  const line = `${record.key},${record.value}\n`;
+
   // Check if we need to rotate
   if (recordCount >= maxRecords) {
     const newSegmentPath = await rotateSegment(dbPath);
-    const line = `${record.key},${record.value}\n`;
+    // Get the offset before writing (should be 0 for new segment)
+    const offset = await getFileSize(newSegmentPath);
     await Deno.writeTextFile(newSegmentPath, line, { append: true });
+    // Update index with the new record
+    updateSegmentIndex(newSegmentPath, record.key, offset);
   } else {
-    const line = `${record.key},${record.value}\n`;
+    // Get the offset before writing
+    const offset = await getFileSize(activeSegment);
     await Deno.writeTextFile(activeSegment, line, { append: true });
+    // Update index with the new record
+    updateSegmentIndex(activeSegment, record.key, offset);
   }
 }
 
@@ -293,7 +490,7 @@ export async function set(
 }
 
 /**
- * Get a value by key from the database.
+ * Get a value by key from the database using indices for fast lookup.
  * Returns the last occurrence of the key (most recent value).
  * Returns null if the key doesn't exist or was deleted (tombstone).
  */
@@ -301,13 +498,24 @@ export async function get(
   dbPath: string,
   key: string,
 ): Promise<string | null> {
-  const records = await readAllRecords(dbPath);
-  // Search backwards to find the last occurrence
-  for (let i = records.length - 1; i >= 0; i--) {
-    if (records[i].key === key) {
-      return records[i].value;
+  // Get all segments from newest to oldest (reverse order)
+  const segments = await listSegments(dbPath);
+
+  // Search from the most recent segment backwards
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const segmentPath = segments[i];
+    const index = await getSegmentIndex(segmentPath);
+
+    // Check if the key exists in this segment's index
+    const offset = index.get(key);
+    if (offset !== undefined) {
+      // Found it! Read the record at this offset
+      const record = await readRecordAtOffset(segmentPath, offset);
+      return record?.value ?? null;
     }
   }
+
+  // Key not found in any segment
   return null;
 }
 
