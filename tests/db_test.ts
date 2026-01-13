@@ -158,3 +158,85 @@ Deno.test("db - empty database", async () => {
     }
   }
 });
+
+Deno.test("db - append-only: updates append new records", async () => {
+  const testDbPath = "./test_data_append.db";
+
+  try {
+    await db.set(testDbPath, "key1", "value1");
+    await db.set(testDbPath, "key1", "value2");
+    await db.set(testDbPath, "key1", "value3");
+
+    // Should return the last value
+    const value = await db.get(testDbPath, "key1");
+    assertEquals(value, "value3");
+
+    // File should contain all three records
+    const content = await Deno.readTextFile(testDbPath);
+    const lines = content.trim().split("\n");
+    assertEquals(lines.length, 3);
+    assertEquals(lines[0], "key1,value1");
+    assertEquals(lines[1], "key1,value2");
+    assertEquals(lines[2], "key1,value3");
+  } finally {
+    try {
+      await Deno.remove(testDbPath);
+    } catch {
+      // Ignore if file doesn't exist
+    }
+  }
+});
+
+Deno.test("db - append-only: deletes use tombstones", async () => {
+  const testDbPath = "./test_data_tombstone.db";
+
+  try {
+    await db.set(testDbPath, "key1", "value1");
+    await db.del(testDbPath, "key1");
+
+    // Should return null (deleted)
+    const value = await db.get(testDbPath, "key1");
+    assertEquals(value, null);
+
+    // File should contain both records (original + tombstone)
+    const content = await Deno.readTextFile(testDbPath);
+    const lines = content.trim().split("\n");
+    assertEquals(lines.length, 2);
+    assertEquals(lines[0], "key1,value1");
+    assertEquals(lines[1], "key1,null");
+  } finally {
+    try {
+      await Deno.remove(testDbPath);
+    } catch {
+      // Ignore if file doesn't exist
+    }
+  }
+});
+
+Deno.test("db - append-only: can resurrect deleted keys", async () => {
+  const testDbPath = "./test_data_resurrect.db";
+
+  try {
+    await db.set(testDbPath, "key1", "value1");
+    await db.del(testDbPath, "key1");
+    await db.set(testDbPath, "key1", "value2");
+
+    // Should return the resurrected value
+    const value = await db.get(testDbPath, "key1");
+    assertEquals(value, "value2");
+
+    // File should contain all three records
+    const content = await Deno.readTextFile(testDbPath);
+    const lines = content.trim().split("\n");
+    assertEquals(lines.length, 3);
+    assertEquals(lines[0], "key1,value1");
+    assertEquals(lines[1], "key1,null");
+    assertEquals(lines[2], "key1,value2");
+  } finally {
+    try {
+      await Deno.remove(testDbPath);
+    } catch {
+      // Ignore if file doesn't exist
+    }
+  }
+});

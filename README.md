@@ -38,8 +38,7 @@ logkv set hello world
 logkv get hello
 ```
 
-Your watcher will keep rebuilding `./logkv` and the symlink will always point to
-the latest binary.
+Your watcher will keep rebuilding `./logkv` and the symlink will always point to the latest binary.
 
 ---
 
