@@ -6,18 +6,20 @@ const VERSION = "0.1.0";
 export async function runCLI(args: string[]) {
   const parsedArgs = parseArgs(args, {
     boolean: ["help", "version", "verbose", "json"],
-    string: ["db-path"],
+    string: ["db-path", "segment-size"],
     alias: {
       h: "help",
       v: "version",
       d: "db-path",
       V: "verbose",
       j: "json",
+      s: "segment-size",
     },
     default: {
       "db-path": "./data.db",
       verbose: false,
       json: false,
+      "segment-size": "1000",
     },
   });
 
@@ -42,6 +44,21 @@ export async function runCLI(args: string[]) {
   }
 
   const dbPath = parsedArgs["db-path"];
+  const segmentSize = parseInt(parsedArgs["segment-size"], 10);
+
+  if (isNaN(segmentSize) || segmentSize <= 0) {
+    console.error(
+      "%cError:%c Invalid segment size. Must be a positive number.",
+      "color: red; font-weight: bold",
+      "",
+    );
+    return 1;
+  }
+
+  const dbConfig: db.DbConfig = {
+    maxSegmentRecords: segmentSize,
+  };
+
   const command = String(parsedArgs._[0]);
 
   try {
@@ -59,7 +76,7 @@ export async function runCLI(args: string[]) {
         const key = String(parsedArgs._[1]);
         const value = String(parsedArgs._[2]);
 
-        await db.set(dbPath, key, value);
+        await db.set(dbPath, key, value, dbConfig);
 
         if (parsedArgs.json) {
           console.log(JSON.stringify({ success: true, key, value }));
@@ -128,7 +145,7 @@ export async function runCLI(args: string[]) {
           return 1;
         }
         const key = String(parsedArgs._[1]);
-        const deleted = await db.del(dbPath, key);
+        const deleted = await db.del(dbPath, key, dbConfig);
 
         if (deleted) {
           if (parsedArgs.json) {
@@ -265,6 +282,7 @@ function printUsage() {
   -h, --help              Show this help message
   -v, --version           Show version information
   -d, --db-path <PATH>    Path to database file (default: ./data.db)
+  -s, --segment-size <N>  Max records per segment before rotation (default: 1000)
   -V, --verbose           Enable verbose output
   -j, --json              Output results in JSON format
 

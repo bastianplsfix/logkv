@@ -64,13 +64,35 @@ all                     List all records
 
 ## How It Works
 
-File-based storage using CSV format. Operations read entire file, modify in
-memory, write back.
+Append-only file-based storage with segments and compaction:
+
+- **Append-only writes**: Updates and deletes append new records (tombstones for deletes)
+- **Immutable records**: Old data remains until compaction
+- **Segment rotation**: Files split into segments when reaching size limit
+- **Background compaction**: Old segments are merged, removing stale/deleted data
+- **Multi-segment reads**: Queries scan all segments, returning latest values
+
+### Segment Size Configuration
+
+Control when files rotate using the `--segment-size` (or `-s`) option:
+
+```bash
+# Use small segment size for testing (rotates every 5 records)
+./logkv --segment-size 5 set key1 value1
+
+# Default is 1000 records per segment
+./logkv set key1 value1
+```
+
+### Storage Format
+
+Each segment stores records in CSV format:
 
 ```
 key1,value1
 key2,value2
+key3,null          # tombstone (deleted)
+key1,updated1      # update creates new record
 ```
 
-Simple but not optimized – future iterations will add indexing, append-only
-logs, and compaction.
+Segments are named: `data.db`, `data.1.db`, `data.2.db`, etc.
