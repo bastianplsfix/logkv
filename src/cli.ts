@@ -238,6 +238,52 @@ export async function runCLI(args: string[]) {
         return 0;
       }
 
+      case "range": {
+        if (parsedArgs._.length < 2) {
+          console.error(
+            "%cError:%c 'range' requires start and optionally end keys",
+            "color: red; font-weight: bold",
+            "",
+          );
+          console.error("\nUsage: logkv range <start> [end]");
+          return 1;
+        }
+        const start = String(parsedArgs._[1]);
+        const end = parsedArgs._[2] ? String(parsedArgs._[2]) : undefined;
+
+        const records = await db.range(dbPath, start, end);
+
+        if (parsedArgs.json) {
+          console.log(
+            JSON.stringify({ success: true, records, count: records.length }),
+          );
+        } else {
+          if (records.length === 0) {
+            console.log("No records found in range");
+          } else {
+            if (parsedArgs.verbose) {
+              console.log(
+                `Found %c${records.length}%c record${
+                  records.length === 1 ? "" : "s"
+                } in range:`,
+                "color: cyan; font-weight: bold",
+                "",
+              );
+            }
+            records.forEach((record) => {
+              console.log(
+                `  %c${record.key}%c = %c${record.value}%c`,
+                "color: cyan",
+                "",
+                "color: yellow",
+                "",
+              );
+            });
+          }
+        }
+        return 0;
+      }
+
       default:
         console.error(
           `%cError:%c Unknown command '%c${command}%c'`,
@@ -292,6 +338,7 @@ function printUsage() {
   delete|del|rm <key>     Delete a key-value pair
   keys|ls                 List all keys
   all|list                List all key-value pairs
+  range <start> [end]     List key-value pairs in range [start, end)
 
 %cEXAMPLES:%c
   logkv set hello world

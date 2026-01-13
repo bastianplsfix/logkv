@@ -159,8 +159,21 @@ Deno.test("db - empty database", async () => {
   }
 });
 
-Deno.test("db - append-only: updates append new records", async () => {
+Deno.test("db - LSM: updates keep latest value in memtable", async () => {
   const testDbPath = "./test_data_append.db";
+  const walPath = "./test_data_append.wal";
+
+  // Clean up before test
+  try {
+    await Deno.remove(testDbPath);
+  } catch {
+    // Ignore
+  }
+  try {
+    await Deno.remove(walPath);
+  } catch {
+    // Ignore
+  }
 
   try {
     await db.set(testDbPath, "key1", "value1");
@@ -171,9 +184,9 @@ Deno.test("db - append-only: updates append new records", async () => {
     const value = await db.get(testDbPath, "key1");
     assertEquals(value, "value3");
 
-    // File should contain all three records
-    const content = await Deno.readTextFile(testDbPath);
-    const lines = content.trim().split("\n");
+    // WAL should contain all three records (for crash recovery)
+    const walContent = await Deno.readTextFile(walPath);
+    const lines = walContent.trim().split("\n");
     assertEquals(lines.length, 3);
     assertEquals(lines[0], "key1,value1");
     assertEquals(lines[1], "key1,value2");
@@ -181,14 +194,28 @@ Deno.test("db - append-only: updates append new records", async () => {
   } finally {
     try {
       await Deno.remove(testDbPath);
+      await Deno.remove(walPath);
     } catch {
       // Ignore if file doesn't exist
     }
   }
 });
 
-Deno.test("db - append-only: deletes use tombstones", async () => {
+Deno.test("db - LSM: deletes use tombstones in memtable", async () => {
   const testDbPath = "./test_data_tombstone.db";
+  const walPath = "./test_data_tombstone.wal";
+
+  // Clean up before test
+  try {
+    await Deno.remove(testDbPath);
+  } catch {
+    // Ignore
+  }
+  try {
+    await Deno.remove(walPath);
+  } catch {
+    // Ignore
+  }
 
   try {
     await db.set(testDbPath, "key1", "value1");
@@ -198,23 +225,37 @@ Deno.test("db - append-only: deletes use tombstones", async () => {
     const value = await db.get(testDbPath, "key1");
     assertEquals(value, null);
 
-    // File should contain both records (original + tombstone)
-    const content = await Deno.readTextFile(testDbPath);
-    const lines = content.trim().split("\n");
+    // WAL should contain both records (original + tombstone)
+    const walContent = await Deno.readTextFile(walPath);
+    const lines = walContent.trim().split("\n");
     assertEquals(lines.length, 2);
     assertEquals(lines[0], "key1,value1");
     assertEquals(lines[1], "key1,null");
   } finally {
     try {
       await Deno.remove(testDbPath);
+      await Deno.remove(walPath);
     } catch {
       // Ignore if file doesn't exist
     }
   }
 });
 
-Deno.test("db - append-only: can resurrect deleted keys", async () => {
+Deno.test("db - LSM: can resurrect deleted keys", async () => {
   const testDbPath = "./test_data_resurrect.db";
+  const walPath = "./test_data_resurrect.wal";
+
+  // Clean up before test
+  try {
+    await Deno.remove(testDbPath);
+  } catch {
+    // Ignore
+  }
+  try {
+    await Deno.remove(walPath);
+  } catch {
+    // Ignore
+  }
 
   try {
     await db.set(testDbPath, "key1", "value1");
@@ -225,9 +266,9 @@ Deno.test("db - append-only: can resurrect deleted keys", async () => {
     const value = await db.get(testDbPath, "key1");
     assertEquals(value, "value2");
 
-    // File should contain all three records
-    const content = await Deno.readTextFile(testDbPath);
-    const lines = content.trim().split("\n");
+    // WAL should contain all three records
+    const walContent = await Deno.readTextFile(walPath);
+    const lines = walContent.trim().split("\n");
     assertEquals(lines.length, 3);
     assertEquals(lines[0], "key1,value1");
     assertEquals(lines[1], "key1,null");
@@ -235,6 +276,7 @@ Deno.test("db - append-only: can resurrect deleted keys", async () => {
   } finally {
     try {
       await Deno.remove(testDbPath);
+      await Deno.remove(walPath);
     } catch {
       // Ignore if file doesn't exist
     }
@@ -270,26 +312,30 @@ async function cleanupSegments(dbPath: string) {
 
 Deno.test("segments - rotation at size limit", async () => {
   const testDbPath = "./test_segments_rotation.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
-    // Add 7 records with segment size of 3
+    // Add 7 records with memtable size of 3
+    // This should trigger flushes: 3 records -> flush -> 3 more -> flush -> 1 in memtable
     for (let i = 1; i <= 7; i++) {
       await db.set(testDbPath, `key${i}`, `value${i}`, config);
     }
 
-    // Should create multiple segments
+    // Should create multiple SSTable files
     const segments: string[] = [];
     for await (const entry of Deno.readDir(".")) {
-      if (entry.name.startsWith("test_segments_rotation")) {
+      if (
+        entry.name.startsWith("test_segments_rotation") &&
+        entry.name.endsWith(".db")
+      ) {
         segments.push(entry.name);
       }
     }
 
-    // Should have at least 2 segments (main + rotated)
+    // Should have at least 2 SSTables (first flush creates 1.db, second creates 2.db)
     assertEquals(segments.length >= 2, true);
 
-    // All records should be readable
+    // All records should be readable (some from memtable, some from SSTables)
     for (let i = 1; i <= 7; i++) {
       const value = await db.get(testDbPath, `key${i}`);
       assertEquals(value, `value${i}`);
@@ -301,10 +347,10 @@ Deno.test("segments - rotation at size limit", async () => {
 
 Deno.test("segments - reads across multiple segments", async () => {
   const testDbPath = "./test_segments_reads.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
-    // Add 10 records, triggering multiple rotations
+    // Add 10 records, triggering multiple flushes
     for (let i = 1; i <= 10; i++) {
       await db.set(testDbPath, `key${i}`, `value${i}`, config);
     }
@@ -324,7 +370,7 @@ Deno.test("segments - reads across multiple segments", async () => {
 
 Deno.test("segments - updates across segments", async () => {
   const testDbPath = "./test_segments_updates.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
     // Add initial records
@@ -346,7 +392,7 @@ Deno.test("segments - updates across segments", async () => {
 
 Deno.test("segments - deletes across segments", async () => {
   const testDbPath = "./test_segments_deletes.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
     // Add records across multiple segments
@@ -374,7 +420,7 @@ Deno.test("segments - deletes across segments", async () => {
 
 Deno.test("segments - compaction removes stale data", async () => {
   const testDbPath = "./test_segments_compaction.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
     // Add enough records to trigger compaction (need 4+ segments before rotation)
@@ -412,7 +458,7 @@ Deno.test("segments - compaction removes stale data", async () => {
 
 Deno.test("segments - compaction with updates and deletes", async () => {
   const testDbPath = "./test_segments_compact_updates.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
     // Create stale data by updating and deleting
@@ -444,7 +490,7 @@ Deno.test("segments - compaction with updates and deletes", async () => {
 
 Deno.test("segments - segment ID continuity after compaction", async () => {
   const testDbPath = "./test_segments_id_continuity.db";
-  const config: db.DbConfig = { maxSegmentRecords: 3 };
+  const config: db.DbConfig = { maxMemtableRecords: 3 };
 
   try {
     // Add enough records to trigger compaction
@@ -483,7 +529,7 @@ Deno.test("segments - segment ID continuity after compaction", async () => {
 
 Deno.test("segments - small segment size stress test", async () => {
   const testDbPath = "./test_segments_stress.db";
-  const config: db.DbConfig = { maxSegmentRecords: 2 }; // Very small segments
+  const config: db.DbConfig = { maxMemtableRecords: 2 }; // Very small memtable
 
   try {
     // Add many records with tiny segments
